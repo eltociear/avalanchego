@@ -99,6 +99,17 @@ func (te *TestEnvironment) Setup(
 		return err
 	}
 
+	// Need to always configure avalanchego.  Even if using a
+	// persistent network, avalanchego is required for operations like
+	// node addition.
+	if avalancheGoExecPath != "" {
+		if _, err := os.Stat(avalancheGoExecPath); err != nil {
+			return fmt.Errorf("could not find avalanchego binary: %w", err)
+		}
+	}
+	te.avalancheGoExecPath = avalancheGoExecPath
+	te.avalancheGoLogLevel = avalancheGoLogLevel
+
 	// TODO(marun) Maybe lazy-load so that errors only fail dependent tests?
 	err = te.LoadKeys(testKeysFile)
 	if err != nil {
@@ -111,24 +122,12 @@ func (te *TestEnvironment) Setup(
 		tests.Outf("{{yellow}}Using a pre-existing network{{/}}\n")
 
 		// Read the URIs for the existing network so that tests can access the nodes.
-
 		err = te.refreshURIs()
 		if err != nil {
 			return err
 		}
 	} else {
 		te.clusterType = StandAlone
-
-		// Create a new network
-
-		if avalancheGoExecPath != "" {
-			if _, err := os.Stat(avalancheGoExecPath); err != nil {
-				return fmt.Errorf("could not find avalanchego binary: %w", err)
-			}
-		}
-
-		te.avalancheGoExecPath = avalancheGoExecPath
-		te.avalancheGoLogLevel = avalancheGoLogLevel
 
 		err := te.startCluster()
 		if err != nil {
@@ -221,8 +220,20 @@ func (te *TestEnvironment) startCluster() error {
 
 	tests.Outf("{{green}}successfully started network: {{/}} %+v\n", resp.ClusterInfo.NodeNames)
 
-	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
-	_, err = te.GetRunnerClient().Health(ctx)
+	err = te.CheckHealth()
+	if err != nil {
+		return err
+	}
+
+	te.isNetworkPristine = true
+
+	err = te.refreshURIs()
+	return err
+}
+
+func (te *TestEnvironment) CheckHealth() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	_, err := te.GetRunnerClient().Health(ctx)
 	cancel()
 	if err != nil {
 		return fmt.Errorf("could not check network health: %w", err)
@@ -230,10 +241,7 @@ func (te *TestEnvironment) startCluster() error {
 
 	tests.Outf("{{green}}network reporting health{{/}}\n")
 
-	te.isNetworkPristine = true
-
-	err = te.refreshURIs()
-	return err
+	return nil
 }
 
 func (te *TestEnvironment) refreshURIs() error {
@@ -364,4 +372,17 @@ func (te *TestEnvironment) Teardown() error {
 
 	tests.Outf("{{red}}shutting down network-runner client{{/}}\n")
 	return te.closeRunnerClient()
+}
+
+func (te *TestEnvironment) AddNode(name string, opts ...runner_sdk.OpOption) error {
+	ctx, cancel := context.WithTimeout(context.Background(), DefaultShutdownTimeout)
+	_, err := te.GetRunnerClient().AddNode(ctx, name, te.avalancheGoExecPath, opts...)
+	cancel()
+	if err != nil {
+		return err
+	}
+
+	tests.Outf("{{green}}added node %s{{/}}\n", name)
+
+	return nil
 }

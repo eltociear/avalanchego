@@ -94,6 +94,7 @@ func TestRewardsChecksRewardValidatorAndDelegator(t *testing.T) {
 			continuousValidatorTx, _, err := addContinuousValidator(
 				env,
 				validatorData,
+				0, // restakeShare
 				validatorStakeKey,
 				authOwner,
 				validatorRewardOwner,
@@ -300,6 +301,7 @@ func TestRewardsChecksRewardValidator(t *testing.T) {
 			_, addContinuousValTxID, err := addContinuousValidator(
 				env,
 				validatorData,
+				0, // restakeShare
 				stakeKey,
 				authOwner,
 				rewardOwner,
@@ -476,6 +478,7 @@ func TestShiftChecksRewardValidator(t *testing.T) {
 			_, addContinuousValTxID, err := addContinuousValidator(
 				env,
 				validatorData,
+				0, // restakeShare
 				authKey,
 				addr, // authOwner
 				addr, // rewardOwner
@@ -638,6 +641,7 @@ func TestRewardsChecksRewardDelegator(t *testing.T) {
 			addContinuousValTx, _, err := addContinuousValidator(
 				env,
 				validatorData,
+				0, // restakeShare
 				validatorKey,
 				authOwner,
 				validatorOwner,
@@ -863,6 +867,7 @@ func TestShiftChecksRewardDelegator(t *testing.T) {
 			_, _, err := addContinuousValidator(
 				env,
 				validatorData,
+				0, // restakeShare
 				authKey,
 				addr,
 				addr,
@@ -2085,6 +2090,7 @@ func addContinuousDelegator(
 func addContinuousValidator(
 	env *environment,
 	validatorData txs.Validator,
+	restakeShare uint32,
 	validatorStakeKey *secp256k1.PrivateKey,
 	authOwner, validatorRewardOwner ids.ShortID,
 ) (
@@ -2130,7 +2136,7 @@ func addContinuousValidator(
 			Addrs:     []ids.ShortID{validatorRewardOwner},
 			Threshold: 1,
 		},
-		ValidatorRewardRestakeShares: 0,
+		ValidatorRewardRestakeShares: restakeShare,
 		DelegatorRewardsOwner: &secp256k1fx.OutputOwners{
 			Addrs:     []ids.ShortID{validatorRewardOwner},
 			Threshold: 1,

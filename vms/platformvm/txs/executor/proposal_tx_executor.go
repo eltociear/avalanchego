@@ -373,6 +373,7 @@ func (e *ProposalTxExecutor) RewardValidatorTx(tx *txs.RewardValidatorTx) error 
 
 	// Invariant: A [txs.DelegatorTx] does not also implement the
 	//            [txs.ValidatorTx] interface.
+	var rewardToBeRestaked uint64
 	switch uStakerTx := stakerTx.Unsigned.(type) {
 	// TODO ABENEGIA: if a validator and a delegator terminates at the same time
 	// the delegator will be handled first due to priority. This means that delegator
@@ -381,7 +382,7 @@ func (e *ProposalTxExecutor) RewardValidatorTx(tx *txs.RewardValidatorTx) error 
 	// should be done. Maybe we should introduce an ad-hoc priority (extending vs stopping)
 	// to properly handle the case. It seems the simplest to me
 	case txs.ValidatorTx:
-		if err := e.rewardValidatorTx(uStakerTx, stakerToReward); err != nil {
+		if rewardToBeRestaked, err = e.rewardValidatorTx(uStakerTx, stakerToReward); err != nil {
 			return err
 		}
 	case txs.DelegatorTx:
@@ -410,10 +411,10 @@ func (e *ProposalTxExecutor) RewardValidatorTx(tx *txs.RewardValidatorTx) error 
 	// here both commit and abort state supplies are correct. We can remove or
 	// shift staker, with the right potential reward in the second case
 	if _, ok := stakerTx.Unsigned.(txs.ValidatorTx); ok {
-		if err := handleValidatorShift(e.OnCommitState, stakerToReward); err != nil {
+		if err := handleValidatorShift(e.OnCommitState, stakerToReward, rewardToBeRestaked); err != nil {
 			return err
 		}
-		if err := handleValidatorShift(e.OnAbortState, stakerToReward); err != nil {
+		if err := handleValidatorShift(e.OnAbortState, stakerToReward, rewardToBeRestaked); err != nil {
 			return err
 		}
 	} else { // must be txs.DelegatorTx due to switch check above
@@ -437,16 +438,18 @@ func (e *ProposalTxExecutor) RewardValidatorTx(tx *txs.RewardValidatorTx) error 
 func (e *ProposalTxExecutor) rewardValidatorTx(
 	uValidatorTx txs.ValidatorTx,
 	validator *state.Staker,
-) error {
+) (uint64, error) {
 	var (
 		txID    = validator.TxID
 		stake   = uValidatorTx.Stake()
 		outputs = uValidatorTx.Outputs()
 		// Invariant: The staked asset must be equal to the reward asset.
 		stakeAsset = stake[0].Asset
+
+		shouldRestake = validator.ShouldRestake()
 	)
 
-	if !validator.ShouldRestake() {
+	if !shouldRestake {
 		// Refund the stake only when validator is about to leave
 		// the staking set
 		for i, out := range stake {
@@ -466,23 +469,39 @@ func (e *ProposalTxExecutor) rewardValidatorTx(
 	// following Continuous staking fork activation multiple rewards UTXOS
 	// can be cumulated, each related to a different staking period. We make
 	// sure to index the reward UTXOs correctly by appending them to previous ones.
+	// Invariant: GetRewardUTXOs keeps returning UTXOs even if when they are consumed
 	utxosOffset := len(outputs) + len(stake)
 	currentRewardUTXOs, err := e.OnCommitState.GetRewardUTXOs(txID)
 	if err != nil {
-		return fmt.Errorf("failed to create output: %w", err)
+		return 0, fmt.Errorf("failed to create output: %w", err)
 	}
 	utxosOffset += len(currentRewardUTXOs)
 
+	var (
+		rewardToBeRestaked = uint64(0)
+		rewardToBeRepaid   = validator.PotentialReward
+	)
+
+	continuousValTx, isContinuousVal := uValidatorTx.(txs.ContinuousStaker)
+	if isContinuousVal && shouldRestake {
+		// calculate fraction to be restake, making sure that it does not exceed MaxValidatorStake
+		rewardToBeRestaked = rewardToBeRepaid * uint64(continuousValTx.RestakeShares()/reward.PercentDenominator)
+		if validator.Weight+rewardToBeRestaked > e.Config.MaxValidatorStake {
+			rewardToBeRestaked = 0
+		}
+		rewardToBeRepaid -= rewardToBeRestaked
+	}
+
 	// Provide the reward here
-	if validator.PotentialReward > 0 {
+	if rewardToBeRepaid > 0 {
 		validationRewardsOwner := uValidatorTx.ValidationRewardsOwner()
 		outIntf, err := e.Fx.CreateOutput(validator.PotentialReward, validationRewardsOwner)
 		if err != nil {
-			return fmt.Errorf("failed to create output: %w", err)
+			return 0, fmt.Errorf("failed to create output: %w", err)
 		}
 		out, ok := outIntf.(verify.State)
 		if !ok {
-			return ErrInvalidState
+			return 0, ErrInvalidState
 		}
 
 		utxo := &avax.UTXO{
@@ -505,18 +524,28 @@ func (e *ProposalTxExecutor) rewardValidatorTx(
 		validator.NodeID,
 	)
 	if err != nil && err != database.ErrNotFound {
-		return fmt.Errorf("failed to fetch accrued delegatee rewards: %w", err)
+		return 0, fmt.Errorf("failed to fetch accrued delegatee rewards: %w", err)
+	}
+
+	if isContinuousVal && shouldRestake {
+		// calculate fraction to be restake, making sure that it does not excees MaxValidatorStake
+		delegateeRewardToBeRestaked := delegateeReward * uint64(continuousValTx.RestakeShares()/reward.PercentDenominator)
+		if validator.Weight+rewardToBeRestaked+delegateeRewardToBeRestaked > e.Config.MaxValidatorStake {
+			delegateeRewardToBeRestaked = 0
+		}
+		delegateeReward -= delegateeRewardToBeRestaked
+		rewardToBeRestaked += delegateeRewardToBeRestaked
 	}
 
 	if delegateeReward > 0 {
 		delegationRewardsOwner := uValidatorTx.DelegationRewardsOwner()
 		outIntf, err := e.Fx.CreateOutput(delegateeReward, delegationRewardsOwner)
 		if err != nil {
-			return fmt.Errorf("failed to create output: %w", err)
+			return 0, fmt.Errorf("failed to create output: %w", err)
 		}
 		out, ok := outIntf.(verify.State)
 		if !ok {
-			return ErrInvalidState
+			return 0, ErrInvalidState
 		}
 
 		onCommitUtxo := &avax.UTXO{
@@ -543,12 +572,13 @@ func (e *ProposalTxExecutor) rewardValidatorTx(
 		e.OnAbortState.AddUTXO(onAbortUtxo)
 		e.OnAbortState.AddRewardUTXO(txID, onAbortUtxo)
 	}
-	return nil
+	return rewardToBeRestaked, nil
 }
 
 func handleValidatorShift(
 	baseState state.Chain,
 	validator *state.Staker,
+	rewardToBeRestaked uint64,
 ) error {
 	if !validator.ShouldRestake() {
 		baseState.DeleteCurrentValidator(validator)
@@ -557,6 +587,7 @@ func handleValidatorShift(
 
 	shiftedStaker := *validator
 	state.ShiftValidatorAheadInPlace(&shiftedStaker)
+	shiftedStaker.Weight += rewardToBeRestaked
 
 	currentSupply, potentialReward, err := calculatePotentialReward(
 		baseState,
